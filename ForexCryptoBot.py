@@ -473,13 +473,17 @@ async def setplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"✅ Plan for {target_id} set to {plan}.")
 
+async def post_init(app):
+    app.job_queue.run_repeating(check_alerts, interval=60, first=10)
+    # Add other background tasks here too
 
 # ✅ Main Bot Function
 
 
 async def main():
     print("🚀 Bot is running...")
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("crypto", crypto))

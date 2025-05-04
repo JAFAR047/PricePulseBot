@@ -1,1 +1,1 @@
-worker: python ForexCryptoBot.py
+worker: python CryptoBot.py

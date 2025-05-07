@@ -825,7 +825,11 @@ async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`Bank:` Opay\n"
         "`Name:` MAIMUNAT AL-AMIN YARO\n"
         "`Account:` 8068446778\n\n"
-        "📩 After payment, send your screenshot to [@uncannyvintage](https://t.me/uncannyvintage) for a manual upgrade.\n\n"
+        "🪙 *Pay with USDT (TRC20)*\n"
+        "Send exactly $3 USDT (TRC20) to the wallet below:\n\n"
+        "`TQHw2F63cC8QoyUR5iCLhWfUzvNmvqdwej`\n\n"
+        "⚠️ Only send TRC20 USDT. Other networks will be lost.\n"
+        "📩 After payment, send your screenshot and User ID to [@PricePulseDev](https://t.me/PricePulseDev) for a manual upgrade.\n\n"
         "Thank you for supporting the future of *PricePulseBot*! 💼",
         parse_mode="Markdown",
         disable_web_page_preview=True

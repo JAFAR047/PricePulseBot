@@ -2034,7 +2034,7 @@ async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """🆘 *PricePulseBot Help Menu*
 
 Welcome to your all-in-one crypto alert assistant. Here’s how to use the bot effectively:
@@ -2175,7 +2175,7 @@ async def main():
     app.add_handler(CommandHandler("volume", volume))
     app.add_handler(CommandHandler("risk", risk))
     app.add_handler(CommandHandler("custom", custom))
-    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("help", help))
     app.add_handler(CommandHandler("addasset", addasset))
     app.add_handler(CommandHandler("portfolio", portfolio))
     app.add_handler(CommandHandler("portfoliolimit", portfoliolimit))

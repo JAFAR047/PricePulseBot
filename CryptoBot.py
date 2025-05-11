@@ -4,6 +4,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram import Bot
 from telegram.ext import CallbackQueryHandler
 from dotenv import load_dotenv
+from collections import defaultdict
 import asyncio
 import requests
 import sqlite3
@@ -66,6 +67,17 @@ cached_worst = {
 
 alert_store = {}
 
+price_cache = {}  # Structure: { "BTCUSDT": {"price": 62000.0, "timestamp": 1715000000} }
+
+api_usage_stats = {
+    "daily": 0,
+    "weekly": 0,
+    "last_reset_day": datetime.utcnow().date(),
+    "last_reset_week": datetime.utcnow().isocalendar()[1]
+}
+
+bot_start_time = datetime.utcnow()
+
 
 # ✅ Load environment variables
 load_dotenv()
@@ -74,6 +86,10 @@ if not TELEGRAM_BOT_TOKEN:
     raise ValueError("❌ TELEGRAM_BOT_TOKEN is missing! Check your .env file.")
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 CRYPTOCOMPARE_API_KEY = os.getenv("CRYPTOCOMPARE_API_KEY")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+if not ADMIN_ID:
+    raise ValueError("❌ ADMIN_ID is missing! Please check your .env file.")
+
 # ✅ Use a single database file for all tables
 DB_FILE = os.path.join(os.path.dirname(__file__), "alerts.db")
 EXCHANGE_RATE_API_KEY = "7aae50601329a3afe6874c11"
@@ -195,9 +211,56 @@ CREATE TABLE IF NOT EXISTS trade_signals (
 init_db()
 
 
+import time
+
+def get_cached_price(symbol, ttl=60):
+    symbol = symbol.upper()
+    now = time.time()
+
+    # If cache exists and is fresh, return it
+    if symbol in price_cache:
+        cached = price_cache[symbol]
+        if now - cached["timestamp"] < ttl:
+            return cached["price"]
+
+    # Otherwise, fetch fresh from API
+    price = get_crypto_price(symbol)
+    if price is not None:
+        price_cache[symbol] = {"price": price, "timestamp": now}
+    return price
+
+def count_api_call():
+    today = datetime.utcnow().date()
+    week = datetime.utcnow().isocalendar()[1]
+
+    # Reset daily
+    if api_usage_stats["last_reset_day"] != today:
+        api_usage_stats["daily"] = 0
+        api_usage_stats["last_reset_day"] = today
+
+    # Reset weekly
+    if api_usage_stats["last_reset_week"] != week:
+        api_usage_stats["weekly"] = 0
+        api_usage_stats["last_reset_week"] = week
+
+    # Count it
+    api_usage_stats["daily"] += 1
+    api_usage_stats["weekly"] += 1
+
+def migrate_add_pro_column():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN pro INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        # Column already exists
+        pass
+    conn.close()
+
+migrate_add_pro_column()
 
 # ✅ Fetch Prices
-
 
 def get_crypto_price(symbol="BTC"):
     url = f"https://min-api.cryptocompare.com/data/price?fsym={symbol.upper()}&tsyms=USD"
@@ -214,13 +277,13 @@ def get_crypto_price(symbol="BTC"):
         print(f"❌ CryptoCompare Error: {e} | Symbol tried: {symbol}")
         return None
 
-
-
+    if data is valid:
+        count_api_call()
+        return price
 
 
 
 # ✅ Telegram Bot Handlers
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -231,6 +294,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if command == "set":
             return await set(fake_update, fake_context)
+        elif command == "help":
+            return await help_command(fake_update, fake_context)
         elif command == "alerts":
             return await alerts(fake_update, fake_context)
         elif command == "clear":
@@ -257,20 +322,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) == 0:
-        await update.message.reply_text("❌ Please specify a crypto pair (e.g., /crypto bitcoin)")
+    if len(context.args) != 1:
+        await update.message.reply_text("❌ Usage: /price <symbol>\nExample: /price BTCUSDT")
         return
-    symbol = context.args[0].lower()
-    price = get_crypto_price(symbol)
-    if price:
-        await update.message.reply_text(f"💰 {symbol.upper()} Price: ${price}")
+
+    symbol = context.args[0].upper()
+    price = get_cached_price(symbol)  # Use cache-enabled function
+
+    if price is not None:
+        await update.message.reply_text(f"💰 *{symbol} Price:* ${price:.2f}", parse_mode="Markdown")
     else:
-        await update.message.reply_text("❌ Error fetching crypto price.")
+        await update.message.reply_text("⚠️ Couldn't fetch the price. Please try again later.")
 
 
-
-
-async def set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_price_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if len(context.args) < 3:
         await update.message.reply_text("❌ Usage: /set BTCUSDT > 70000 [repeat]")
@@ -675,6 +740,9 @@ def get_crypto_trend(symbol, timeframe):
         print(f"❌ CryptoCompare Trend Error for {symbol}: {e}")
         return None
 
+    if data is valid:
+        count_api_call()
+        return price
 
 
 
@@ -756,221 +824,211 @@ async def trend(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, user_id, symbol, condition, target_price, repeat FROM alerts")
-    alerts = cursor.fetchall()
 
-    for alert_id, user_id, symbol, condition, target_price, repeat in alerts:
-        # Determine if it's crypto or forex
-        price = get_crypto_price(symbol)
+    # 1. Collect unique symbols from all alert tables
+    all_symbols = set()
+    for table in ["alerts", "percent_alerts", "risk_alerts", "custom_alerts"]:
+        cursor.execute(f"SELECT DISTINCT symbol FROM {table}")
+        all_symbols.update(row[0] for row in cursor.fetchall())
 
-            
+    # 2. Fetch all prices once
+    symbol_prices = {}
+    for symbol in all_symbols:
+        symbol_prices[symbol] = get_crypto_price(symbol)
+
+    # --- PRICE ALERTS ---
+    cursor.execute("SELECT id, user_id, symbol, condition, target_price, repeat FROM alerts")
+    for alert_id, user_id, symbol, cond, target, repeat in cursor.fetchall():
+        price = symbol_prices.get(symbol)
         if price is None:
-            continue  # Skip if price fetch failed
-
-        if (condition == ">" and price >= target_price) or (condition == "<" and price <= target_price):
+            continue
+        if (cond == ">" and price > target) or (cond == "<" and price < target):
             try:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"🚨 Alert Triggered!\n\n{symbol} price is {price} (condition: {condition} {target_price})"
+                    text=f"🔔 *Price Alert: {symbol}*\nCurrent price: ${price:.2f} {cond} {target}",
+                    parse_mode="Markdown"
                 )
             except Exception as e:
-                print(f"Error sending alert to {user_id}: {e}")
-
-            if repeat == 0:
+                print(f"Price alert error: {e}")
+            if not repeat:
                 cursor.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
                 conn.commit()
 
-        # ➕ Check percent-based alerts
+    # --- PERCENT ALERTS ---
     cursor.execute("SELECT id, user_id, symbol, base_price, threshold_percent, repeat FROM percent_alerts")
-    percent_alerts = cursor.fetchall()
-
-    for alert_id, user_id, symbol, base_price, threshold, repeat in percent_alerts:
-        current_price = get_crypto_price(symbol)
-        if current_price is None or base_price == 0:
+    for alert_id, user_id, symbol, base_price, threshold_percent, repeat in cursor.fetchall():
+        price = symbol_prices.get(symbol)
+        if price is None:
             continue
-
-        percent_change = abs((current_price - base_price) / base_price * 100)
-        if percent_change >= threshold:
+        change = abs((price - base_price) / base_price * 100)
+        if change >= threshold_percent:
             try:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"📉 Percentage Alert Triggered!\n\n*{symbol}* changed by {percent_change:.2f}%\n"
-                         f"From ${base_price:.2f} → ${current_price:.2f}",
+                    text=f"📉 *% Alert for {symbol}*\nChange: {change:.2f}% from ${base_price:.2f}\nNow: ${price:.2f}",
                     parse_mode="Markdown"
                 )
             except Exception as e:
-                print(f"Error sending % alert to {user_id}: {e}")
-
-            if repeat == 0:
+                print(f"Percent alert error: {e}")
+            if not repeat:
                 cursor.execute("DELETE FROM percent_alerts WHERE id = ?", (alert_id,))
                 conn.commit()
-        # 📊 Volume Spike Alerts
-    cursor.execute("SELECT id, user_id, symbol, multiplier, repeat FROM volume_alerts")
-    volume_alerts = cursor.fetchall()
 
-    for alert_id, user_id, symbol, multiplier, repeat in volume_alerts:
-        # Fetch last 10 minutes of volume data
-        url = f"https://min-api.cryptocompare.com/data/histominute?fsym={symbol}&tsym=USD&limit=10"
-        headers = {"authorization": f"Apikey {CRYPTOCOMPARE_API_KEY}"}
-
-        try:
-            resp = requests.get(url, headers=headers, timeout=10)
-            data = resp.json()
-            volumes = [candle["volumefrom"] for candle in data.get("Data", []) if "volumefrom" in candle]
-        except Exception as e:
-            print(f"Volume fetch error: {e}")
+    # --- RISK ALERTS ---
+    cursor.execute("SELECT id, user_id, symbol, stop_price, take_price, repeat FROM risk_alerts")
+    for alert_id, user_id, symbol, stop_price, take_price, repeat in cursor.fetchall():
+        price = symbol_prices.get(symbol)
+        if price is None:
             continue
-
-        if len(volumes) < 5:
-            continue
-
-        avg_volume = sum(volumes[:-1]) / (len(volumes) - 1)
-        current_volume = volumes[-1]
-
-        if avg_volume == 0:
-            continue
-
-        if current_volume >= multiplier * avg_volume:
+        if price <= stop_price or price >= take_price:
             try:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=(
-                        f"📊 *Volume Spike Alert!*\n\n"
-                        f"{symbol} volume is up {current_volume:.2f},\n"
-                        f"which is > {multiplier}x the average ({avg_volume:.2f})."
-                    ),
+                    text=f"🛑 *Risk Alert for {symbol}*\nPrice hit ${price:.2f}.\nSL: {stop_price}, TP: {take_price}",
                     parse_mode="Markdown"
                 )
             except Exception as e:
-                print(f"Failed to send volume alert to {user_id}: {e}")
-
-            if repeat == 0:
-                cursor.execute("DELETE FROM volume_alerts WHERE id = ?", (alert_id,))
+                print(f"Risk alert error: {e}")
+            if not repeat:
+                cursor.execute("DELETE FROM risk_alerts WHERE id = ?", (alert_id,))
                 conn.commit()
-        # 🔐 Risk Alerts (Stop-Loss & Take-Profit)
-    cursor.execute("SELECT id, user_id, symbol, stop_price, take_price, repeat FROM risk_alerts")
-    risk_alerts = cursor.fetchall()
 
-    for alert_id, user_id, symbol, stop_price, take_price, repeat in risk_alerts:
-        price = get_crypto_price(symbol)
+    # --- CUSTOM ALERTS (price + RSI/MACD/EMA) ---
+    custom_data_cache = {}  # For RSI, MACD, EMA
+
+    cursor.execute("SELECT id, user_id, symbol, price_condition, price_value, rsi_condition, rsi_value, repeat FROM custom_alerts")
+    for row in cursor.fetchall():
+        alert_id, user_id, symbol, p_cond, p_val, r_cond, r_val, repeat = row
+        price = symbol_prices.get(symbol)
         if price is None:
             continue
 
-        triggered = False
-        reason = ""
+        # Price match
+        price_match = (p_cond == ">" and price > p_val) or (p_cond == "<" and price < p_val)
 
-        if price <= stop_price:
-            triggered = True
-            reason = f"📉 *Stop-Loss Triggered!* {symbol} dropped to ${price:.2f}"
-        elif price >= take_price:
-            triggered = True
-            reason = f"🎯 *Take-Profit Hit!* {symbol} rose to ${price:.2f}"
-
-        if triggered:
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"⚠️ *Risk Alert: {symbol}*\n\n{reason}\n\n"
-                         f"• SL: ${stop_price}\n• TP: ${take_price}",
-                    parse_mode="Markdown"
-                )
-            except Exception as e:
-                print(f"Error sending risk alert: {e}")
-
-            if repeat == 0:
-                cursor.execute("DELETE FROM risk_alerts WHERE id = ?", (alert_id,))
-                conn.commit()
-        # 🧠 Custom Alerts (Price + RSI)
-    cursor.execute("SELECT id, user_id, symbol, price_condition, price_value, rsi_condition, rsi_value, repeat FROM custom_alerts")
-    custom_alerts = cursor.fetchall()
-
-    for row in custom_alerts:
-        alert_id, user_id, symbol, p_cond, p_val, r_cond, r_val, repeat = row
-        price = get_crypto_price(symbol)
+        # RSI/MACD/EMA match
         rsi_match = False
+        try:
+            if r_cond in [">", "<"]:
+                if symbol not in custom_data_cache:
+                    custom_data_cache[symbol] = {}
+                if "rsi" not in custom_data_cache[symbol]:
+                    custom_data_cache[symbol]["rsi"] = get_rsi(symbol)
+                rsi = custom_data_cache[symbol]["rsi"]
+                if rsi is not None:
+                    rsi_match = (r_cond == ">" and rsi > r_val) or (r_cond == "<" and rsi < r_val)
 
-        price_match = False
-        if price is not None:
-            price_match = (p_cond == ">" and price > p_val) or (p_cond == "<" and price < p_val)
-
-        rsi_match = False
-
-        if r_cond in [">", "<"]:
-            rsi = get_rsi(symbol)
-            if rsi is not None:
-                rsi_match = (r_cond == ">" and rsi > r_val) or (r_cond == "<" and rsi < r_val)
-
-        elif r_cond == "macd":
-            macd, signal, hist = get_macd(symbol)
-            if macd is not None:
-                rsi_match = hist > 0
-
-        elif r_cond.startswith("ema>"):
-            try:
-                period = int(r_cond.split(">")[1])
-                prices = get_candles(symbol, period + 5)
-                ema = calculate_ema(prices, period)
-                if ema is not None and price > ema:
+            elif r_cond == "macd":
+                if "macd" not in custom_data_cache.get(symbol, {}):
+                    macd_data = get_macd(symbol)
+                    if symbol not in custom_data_cache:
+                        custom_data_cache[symbol] = {}
+                    custom_data_cache[symbol]["macd"] = macd_data
+                macd, signal, hist = custom_data_cache[symbol]["macd"]
+                if hist > 0:
                     rsi_match = True
-            except:
-                pass
+
+            elif r_cond.startswith("ema>"):
+                period = int(r_cond.split(">")[1])
+                if f"ema{period}" not in custom_data_cache.get(symbol, {}):
+                    candles = get_candles(symbol, period + 5)
+                    ema = calculate_ema(candles, period)
+                    if symbol not in custom_data_cache:
+                        custom_data_cache[symbol] = {}
+                    custom_data_cache[symbol][f"ema{period}"] = ema
+                ema = custom_data_cache[symbol][f"ema{period}"]
+                if ema and price > ema:
+                    rsi_match = True
+        except:
+            continue
 
         if price_match and rsi_match:
             try:
                 await context.bot.send_message(
                     chat_id=user_id,
                     text=(
-                        f"🔔 *Custom Alert Triggered for {symbol}*\n\n"
-                        f"• Price = ${price:.2f} ({p_cond}{p_val}) ✅\n"
-                        f"• RSI = {rsi:.2f} ({r_cond}{r_val}) ✅"
+                        f"🧠 *Custom Alert for {symbol}*\n"
+                        f"Price: ${price:.2f} ({p_cond}{p_val}) ✅\n"
+                        f"Indicator: `{r_cond}` ✅"
                     ),
                     parse_mode="Markdown"
                 )
             except Exception as e:
                 print(f"Custom alert error: {e}")
-
-            if repeat == 0:
+            if not repeat:
                 cursor.execute("DELETE FROM custom_alerts WHERE id = ?", (alert_id,))
                 conn.commit()
-        # 💼 Portfolio Value Alerts
-    cursor.execute("SELECT user_id, loss_limit, profit_target FROM portfolio_limits")
-    user_limits = cursor.fetchall()
 
-    for user_id, loss_limit, profit_target in user_limits:
-        cursor.execute("SELECT symbol, quantity FROM portfolio WHERE user_id = ?", (user_id,))
-        assets = cursor.fetchall()
+        # --- PORTFOLIO VALUE ALERTS ---
+    cursor.execute("""
+    SELECT p.user_id, p.symbol, p.quantity, l.loss_limit, l.profit_target 
+    FROM portfolio p
+    LEFT JOIN portfolio_limits l ON p.user_id = l.user_id
+""")
+
+    portfolios = defaultdict(list)
+    limits = {}
+
+    for user_id, symbol, quantity, loss_limit, profit_target in cursor.fetchall():
+        portfolios[user_id].append((symbol, quantity))
+        limits[user_id] = {"loss_limit": loss_limit, "profit_target": profit_target}
+
+    for user_id, assets in portfolios.items():
+        loss_limit = limits[user_id]["loss_limit"]
+        profit_target = limits[user_id]["profit_target"]
+
+        # 🚫 Skip users who have no value alerts
+        if loss_limit is None and profit_target is None:
+            continue
 
         total_value = 0
-        for symbol, qty in assets:
-            price = get_crypto_price(symbol)
+        missing_data = False
+        for symbol, amount in assets:
+            price = symbol_prices.get(symbol)
             if price is None:
-                price = get_fiat_to_usd(symbol)
-            if price:
-                total_value += qty * price
+                missing_data = True
+                break
+            total_value += price * amount
 
+        if missing_data:
+            continue  # Skip if any symbol price is missing
 
-        if loss_limit and total_value < loss_limit:
+        if loss_limit and total_value <= loss_limit:
             try:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"⚠️ *Portfolio Alert!*\n\nYour total value is *below* your limit: ${total_value:,.2f} < ${loss_limit:,.2f}",
+                    text=(
+                        f"⚠️ *Portfolio Loss Alert*\n"
+                        f"Your total value dropped to ${total_value:,.2f}.\n"
+                        f"Loss limit was: ${loss_limit:,.2f}"
+                    ),
                     parse_mode="Markdown"
                 )
-            except:
-                pass
+            except Exception as e:
+                print(f"Portfolio loss alert error: {e}")
 
-        if profit_target and total_value > profit_target:
+            cursor.execute("UPDATE portfolio_limits SET loss_limit = NULL WHERE user_id = ?", (user_id,))
+            conn.commit()
+
+        elif profit_target and total_value >= profit_target:
             try:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"🎯 *Portfolio Goal Hit!*\n\nValue is now ${total_value:,.2f} > ${profit_target:,.2f}",
+                    text=(
+                        f"🎯 *Portfolio Target Reached*\n"
+                        f"Your total value is now ${total_value:,.2f}.\n"
+                        f"Target goal was: ${profit_target:,.2f}"
+                    ),
                     parse_mode="Markdown"
                 )
-            except:
-                pass
-                
-                conn.close()
+            except Exception as e:
+                print(f"Portfolio profit alert error: {e}")
+
+            cursor.execute("UPDATE portfolio_limits SET profit_target = NULL WHERE user_id = ?", (user_id,))
+            conn.commit()
+    conn.close()
+
 async def alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id =  user_id = update.effective_user.id
 
@@ -1155,7 +1213,9 @@ async def best(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(message, parse_mode="Markdown")
 
-
+    if data is valid:
+        count_api_call()
+        return price
 
 
 
@@ -1205,7 +1265,9 @@ async def worst(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(message, parse_mode="Markdown")
 
-
+    if data is valid:
+        count_api_call()
+        return price
 
 async def news(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.utcnow()
@@ -1241,6 +1303,10 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cached_news["message"] = message
 
     await update.message.reply_text(message, parse_mode="Markdown", disable_web_page_preview=True)
+
+    if data is valid:
+        count_api_call()
+        return price
 
 async def percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1412,6 +1478,10 @@ def get_rsi(symbol, period=14):
     except Exception as e:
         print(f"❌ RSI fetch failed: {e}")
         return None
+
+    if data is valid:
+        count_api_call()
+        return price
 
 async def custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1651,6 +1721,10 @@ def get_candles(symbol, limit=100):
     except Exception as e:
         print(f"Error fetching candles: {e}")
         return []
+
+    if data is valid:
+        count_api_call()
+        return price
 
 def calculate_ema(prices, period):
     if len(prices) < period:
@@ -1963,9 +2037,9 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🧠 Group support (manual commands)\n"
     )
 
-    keyboard = InlineKeyboardMarkup([
+    keyboard = InlineKeyboardMarkup([ 
     [InlineKeyboardButton("🔓 Show Pro Features", callback_data="show_pro_features")],
-    [InlineKeyboardButton("🆘 Help Guide", url="https://t.me/EliteTradeSignalBot?start=help")],
+    [InlineKeyboardButton("🆘 Help Guide", url="https://t.me/EliteTradeSignalBot?start=help")],   
     [InlineKeyboardButton("🚀 Upgrade to Pro", url="https://t.me/EliteTradeSignalBot?start=upgrade")]
 ])
 
@@ -1995,7 +2069,7 @@ async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 Show My Telegram User ID", callback_data="show_user_id")]
     ])
-    
+
     await update.message.reply_text(
         "🚀 *Upgrade to PricePulse Pro — Trade Smarter, Win Bigger!*\n\n"
         "💹 Stop trading blind. Unlock intelligent alerts, advanced indicators, and your personal signal assistant — all inside Telegram.\n\n"
@@ -2034,7 +2108,7 @@ async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
 
 
-async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """🆘 *PricePulseBot Help Menu*
 
 Welcome to your all-in-one crypto alert assistant. Here’s how to use the bot effectively:
@@ -2108,7 +2182,7 @@ _First month ₦2,000 promo available!_
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
-ADMIN_ID = 5633927235  # your Telegram user ID
+  # your Telegram user ID
 
 
 async def setplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2138,6 +2212,61 @@ async def setplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"✅ Plan for {target_id} set to {plan}.")
 
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    chat_id = update.effective_chat.id
+    now = datetime.utcnow()
+    uptime = now - bot_start_time
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # Alert counts
+    cursor.execute("SELECT COUNT(*) FROM alerts")
+    price_alerts = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM percent_alerts")
+    percent_alerts = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM volume_alerts")
+    volume_alerts = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM risk_alerts")
+    risk_alerts = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM custom_alerts")
+    custom_alerts = cursor.fetchone()[0]
+
+    total_alerts = price_alerts + percent_alerts + volume_alerts + risk_alerts + custom_alerts
+
+    # User stats
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_users = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM users WHERE pro = 1")
+    pro_users = cursor.fetchone()[0]
+    free_users = total_users - pro_users
+
+    conn.close()
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"📊 *PricePulseBot Stats*\n\n"
+            f"👥 *Users:* `{total_users}`\n"
+            f"  ┗ Free: `{free_users}` | Pro: `{pro_users}`\n\n"
+            f"📡 *Alerts:* `{total_alerts}` total\n"
+            f"  ┗ Price: {price_alerts}, %: {percent_alerts}, Volume: {volume_alerts}, Risk: {risk_alerts}, Custom: {custom_alerts}\n\n"
+            f"🔌 *Uptime:* `{uptime.days}d {uptime.seconds // 3600}h {(uptime.seconds // 60) % 60}m`\n"
+            f"📈 *API Calls Today:* `{api_usage_stats['daily']}`\n"
+            f"📆 *API Calls This Week:* `{api_usage_stats['weekly']}`"
+        ),
+        parse_mode="Markdown"
+    )
+
+   
 
 # ✅ Main Bot Function
 
@@ -2148,7 +2277,7 @@ async def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("price", price))
-    app.add_handler(CommandHandler("set", set))
+    app.add_handler(CommandHandler("set", set_price_alert))
     app.add_handler(CommandHandler("remove", remove))
     app.add_handler(CommandHandler("percentalerts", percentalerts))
     app.add_handler(CommandHandler("removepercent", removepercent))
@@ -2175,7 +2304,8 @@ async def main():
     app.add_handler(CommandHandler("volume", volume))
     app.add_handler(CommandHandler("risk", risk))
     app.add_handler(CommandHandler("custom", custom))
-    app.add_handler(CommandHandler("help", help))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("addasset", addasset))
     app.add_handler(CommandHandler("portfolio", portfolio))
     app.add_handler(CommandHandler("portfoliolimit", portfoliolimit))

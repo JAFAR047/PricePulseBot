@@ -709,17 +709,31 @@ async def clear_alerts_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if query.data == "confirm_clear":
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM alerts WHERE user_id = ?", (user_id,))
+
+        # List of all alert tables
+        alert_tables = [
+            "alerts",
+            "percent_alerts",
+            "volume_alerts",
+            "risk_alerts",
+            "custom_alerts"
+        ]
+
+        # Delete user's alerts from all tables
+        for table in alert_tables:
+            cursor.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
+
         conn.commit()
 
-        # Check if any alerts remain in DB
-        cursor.execute("SELECT COUNT(*) FROM alerts")
-        total_alerts = cursor.fetchone()[0]
-        if total_alerts == 0:
-            cursor.execute("DELETE FROM sqlite_sequence WHERE name='alerts'")
-            conn.commit()
+        # Optionally reset auto-increment if tables are now empty
+        for table in alert_tables:
+            cursor.execute(f"SELECT COUNT(*) FROM {table}")
+            if cursor.fetchone()[0] == 0:
+                cursor.execute(f"DELETE FROM sqlite_sequence WHERE name='{table}'")
 
+        conn.commit()
         conn.close()
+
         await query.edit_message_text("🧹 All your alerts have been cleared.")
 
     elif query.data == "cancel_clear":
@@ -846,10 +860,31 @@ async def trend(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Invalid indicator. Use rsi, macd, or ema.")
 
+async def get_cached_rsi(symbol, indicator_cache):
+    if "rsi" not in indicator_cache[symbol]:
+        rsi = get_rsi(symbol)
+        indicator_cache[symbol]["rsi"] = rsi
+    return indicator_cache[symbol]["rsi"]
+
+async def get_cached_macd(symbol, indicator_cache):
+    if "macd" not in indicator_cache[symbol]:
+        macd = get_macd(symbol)
+        indicator_cache[symbol]["macd"] = macd
+    return indicator_cache[symbol]["macd"]
+
+async def get_cached_ema(symbol, period, indicator_cache):
+    key = f"ema{period}"
+    if key not in indicator_cache[symbol]:
+        candles = get_candles(symbol, period + 5)
+        ema = calculate_ema(candles, period)
+        indicator_cache[symbol][key] = ema
+    return indicator_cache[symbol][key]
 
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+
+    indicator_cache = defaultdict(dict)  # indicator_cache[symbol]["rsi"], ["macd"], ["ema20"], etc.
 
     # 1. Collect unique symbols from all alert tables
     all_symbols = set()
@@ -936,36 +971,19 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
         # RSI/MACD/EMA match
         rsi_match = False
         try:
-            if r_cond in [">", "<"]:
-                if symbol not in custom_data_cache:
-                    custom_data_cache[symbol] = {}
-                if "rsi" not in custom_data_cache[symbol]:
-                    custom_data_cache[symbol]["rsi"] = get_rsi(symbol)
-                rsi = custom_data_cache[symbol]["rsi"]
-                if rsi is not None:
-                    rsi_match = (r_cond == ">" and rsi > r_val) or (r_cond == "<" and rsi < r_val)
+            if r_cond.startswith("rsi"):
+                rsi = await get_cached_rsi(symbol, indicator_cache)
+                rsi_match = (r_cond == ">" and rsi > r_val) or (r_cond == "<" and rsi < r_val)
 
             elif r_cond == "macd":
-                if "macd" not in custom_data_cache.get(symbol, {}):
-                    macd_data = get_macd(symbol)
-                    if symbol not in custom_data_cache:
-                        custom_data_cache[symbol] = {}
-                    custom_data_cache[symbol]["macd"] = macd_data
-                macd, signal, hist = custom_data_cache[symbol]["macd"]
-                if hist > 0:
-                    rsi_match = True
+                macd, signal, hist = await get_cached_macd(symbol, indicator_cache)
+                rsi_match = hist > 0
 
             elif r_cond.startswith("ema>"):
                 period = int(r_cond.split(">")[1])
-                if f"ema{period}" not in custom_data_cache.get(symbol, {}):
-                    candles = get_candles(symbol, period + 5)
-                    ema = calculate_ema(candles, period)
-                    if symbol not in custom_data_cache:
-                        custom_data_cache[symbol] = {}
-                    custom_data_cache[symbol][f"ema{period}"] = ema
-                ema = custom_data_cache[symbol][f"ema{period}"]
-                if ema and price > ema:
-                    rsi_match = True
+                ema = await get_cached_ema(symbol, period, indicator_cache)
+                rsi_match = ema and price > ema
+
         except:
             continue
 

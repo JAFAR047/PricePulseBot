@@ -315,6 +315,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif command == "edit":
             return await edit_alert_start(fake_update, fake_context)
 
+    args = context.args
+    user_id = update.effective_user.id
+
+    if args:
+        source = args[0]
+        # Log referral source
+        referral_stats[source] += 1  # replace with DB increment if needed
+
+        # Optionally, log to database
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS referrals (
+                source TEXT PRIMARY KEY,
+                clicks INTEGER DEFAULT 0
+            )
+        ''')
+        cursor.execute('''
+            INSERT INTO referrals (source, clicks) 
+            VALUES (?, 1)
+            ON CONFLICT(source) DO UPDATE SET clicks = clicks + 1
+        ''', (source,))
+        conn.commit()
+        conn.close()
+
+
     # Default welcome message if no args
     await update.message.reply_text(
         "👋 Welcome to PricePulseBot!\nUse /menu to get started."
@@ -2223,25 +2249,36 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
-    # Alert counts
+    # Create referrals table if it doesn't exist
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS referrals (
+            source TEXT PRIMARY KEY,
+            clicks INTEGER DEFAULT 0
+        )
+    """)
+
+    # --- Referral Data ---
+    cursor.execute("SELECT source, clicks FROM referrals ORDER BY clicks DESC LIMIT 5")
+    referrals = cursor.fetchall()
+
+    # --- Alerts ---
     cursor.execute("SELECT COUNT(*) FROM alerts")
     price_alerts = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM alerts WHERE repeat = 1")
+    persistent_alerts = cursor.fetchone()[0]
 
     cursor.execute("SELECT COUNT(*) FROM percent_alerts")
     percent_alerts = cursor.fetchone()[0]
-
     cursor.execute("SELECT COUNT(*) FROM volume_alerts")
     volume_alerts = cursor.fetchone()[0]
-
     cursor.execute("SELECT COUNT(*) FROM risk_alerts")
     risk_alerts = cursor.fetchone()[0]
-
     cursor.execute("SELECT COUNT(*) FROM custom_alerts")
     custom_alerts = cursor.fetchone()[0]
 
     total_alerts = price_alerts + percent_alerts + volume_alerts + risk_alerts + custom_alerts
 
-    # User stats
+    # --- Users ---
     cursor.execute("SELECT COUNT(*) FROM users")
     total_users = cursor.fetchone()[0]
 
@@ -2249,24 +2286,36 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pro_users = cursor.fetchone()[0]
     free_users = total_users - pro_users
 
+    cursor.execute("SELECT COUNT(*) FROM users WHERE last_reset = DATE('now')")
+    new_users_today = cursor.fetchone()[0]
+
     conn.close()
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"📊 *PricePulseBot Stats*\n\n"
-            f"👥 *Users:* `{total_users}`\n"
-            f"  ┗ Free: `{free_users}` | Pro: `{pro_users}`\n\n"
-            f"📡 *Alerts:* `{total_alerts}` total\n"
-            f"  ┗ Price: {price_alerts}, %: {percent_alerts}, Volume: {volume_alerts}, Risk: {risk_alerts}, Custom: {custom_alerts}\n\n"
-            f"🔌 *Uptime:* `{uptime.days}d {uptime.seconds // 3600}h {(uptime.seconds // 60) % 60}m`\n"
-            f"📈 *API Calls Today:* `{api_usage_stats['daily']}`\n"
-            f"📆 *API Calls This Week:* `{api_usage_stats['weekly']}`"
-        ),
-        parse_mode="Markdown"
+    # --- Derived Metric ---
+    conversion_rate = (pro_users / total_users) * 100 if total_users else 0
+
+    # --- Build Message ---
+    text = "📊 *PricePulseBot Stats*\n\n"
+
+    if referrals:
+        text += "🔗 *Top Referral Sources:*\n"
+        for source, clicks in referrals:
+            text += f"• `{source}`: {clicks} clicks\n"
+    else:
+        text += "🔗 No referral data yet.\n"
+
+    text += (
+        f"\n👥 *Users:* `{total_users}` total\n"
+        f"  ┗ Free: `{free_users}` | Pro: `{pro_users}`\n"
+        f"  ┗ New Today: `{new_users_today}`\n\n"
+        f"📡 *Alerts:* `{total_alerts}` total\n"
+        f"  ┗ Price: {price_alerts} (🔁 {persistent_alerts})\n"
+        f"  ┗ %: {percent_alerts}, Volume: {volume_alerts}, Risk: {risk_alerts}, Custom: {custom_alerts}\n\n"
+        f"💹 *Pro Conversion Rate:* `{conversion_rate:.2f}%`\n"
     )
 
-   
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+
 
 # ✅ Main Bot Function
 

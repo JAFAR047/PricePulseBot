@@ -9,6 +9,7 @@ import asyncio
 import requests
 import sqlite3
 import os
+import json
 import sys
 import psutil
 import aiohttp
@@ -45,6 +46,191 @@ def check_existing_instance():
 def cleanup_pid():
     if os.path.exists(PID_FILE):
         os.remove(PID_FILE)
+
+def generate_price_chart(symbol, closes):
+    chart_url = "https://quickchart.io/chart"
+    chart_data = {
+        "type": "line",
+        "data": {
+            "labels": list(range(len(closes))),
+            "datasets": [{
+                "label": f"{symbol} Price (24h)",
+                "data": closes,
+                "fill": False,
+                "borderColor": "rgb(75, 192, 192)",
+                "tension": 0.3
+            }]
+        }
+    }
+    return f"{chart_url}?c={requests.utils.quote(json.dumps(chart_data))}"
+
+
+def generate_rsi_chart(symbol, rsi_values):
+    chart = {
+        "type": "line",
+        "data": {
+            "labels": list(range(len(rsi_values))),
+            "datasets": [{
+                "label": f"{symbol} RSI (14)",
+                "data": rsi_values,
+                "borderColor": "orange",
+                "fill": False,
+                "tension": 0.3
+            }]
+        },
+        "options": {
+            "scales": {
+                "y": {"suggestedMin": 0, "suggestedMax": 100}
+            }
+        }
+    }
+    return f"https://quickchart.io/chart?c={requests.utils.quote(json.dumps(chart))}"
+
+def calculate_rsi_series(closes, period=14):
+    if len(closes) < period + 1:
+        return None
+    rsi_values = []
+    for i in range(period, len(closes)):
+        gains = []
+        losses = []
+        for j in range(i - period + 1, i + 1):
+            delta = closes[j] - closes[j - 1]
+            if delta > 0:
+                gains.append(delta)
+                losses.append(0)
+            else:
+                gains.append(0)
+                losses.append(-delta)
+        avg_gain = sum(gains) / period
+        avg_loss = sum(losses) / period
+        if avg_loss == 0:
+            rsi_values.append(100)
+        else:
+            rs = avg_gain / avg_loss
+            rsi_values.append(100 - (100 / (1 + rs)))
+    return rsi_values
+
+def generate_macd_chart(symbol, macd_list, signal_list, hist_list):
+    labels = list(range(len(macd_list)))
+    chart = {
+        "type": "bar",
+        "data": {
+            "labels": labels,
+            "datasets": [
+                {
+                    "type": "line",
+                    "label": "MACD",
+                    "data": macd_list,
+                    "borderColor": "blue",
+                    "fill": False,
+                    "tension": 0.2
+                },
+                {
+                    "type": "line",
+                    "label": "Signal",
+                    "data": signal_list,
+                    "borderColor": "red",
+                    "fill": False,
+                    "tension": 0.2
+                },
+                {
+                    "label": "Histogram",
+                    "data": hist_list,
+                    "backgroundColor": "rgba(75,192,192,0.4)"
+                }
+            ]
+        }
+    }
+    return f"https://quickchart.io/chart?c={requests.utils.quote(json.dumps(chart))}"
+
+
+def compute_macd_series(prices):
+    if len(prices) < 35:
+        return None, None, None
+    macd_list = []
+    signal_list = []
+    hist_list = []
+
+    for i in range(26, len(prices)):
+        ema_12 = calculate_ema(prices[i - 12:i], 12)
+        ema_26 = calculate_ema(prices[i - 26:i], 26)
+        macd = ema_12 - ema_26
+        macd_list.append(macd)
+
+    for i in range(9, len(macd_list)):
+        signal = sum(macd_list[i - 9:i]) / 9
+        hist = macd_list[i] - signal
+        signal_list.append(signal)
+        hist_list.append(hist)
+
+    return macd_list[-len(signal_list):], signal_list, hist_list
+
+
+def generate_ema_chart(symbol, closes, ema_values, period):
+    chart = {
+        "type": "line",
+        "data": {
+            "labels": list(range(len(closes))),
+            "datasets": [
+                {
+                    "label": "Price",
+                    "data": closes,
+                    "borderColor": "blue",
+                    "fill": False,
+                    "tension": 0.2
+                },
+                {
+                    "label": f"{period}-EMA",
+                    "data": ema_values,
+                    "borderColor": "red",
+                    "fill": False,
+                    "tension": 0.2
+                }
+            ]
+        }
+    }
+    return f"https://quickchart.io/chart?c={requests.utils.quote(json.dumps(chart))}"
+
+def generate_portfolio_pie_chart(symbols, values):
+    chart = {
+        "type": "pie",
+        "data": {
+            "labels": symbols,
+            "datasets": [{
+                "data": values,
+                "backgroundColor": [
+                    "#4dc9f6", "#f67019", "#f53794", "#537bc4",
+                    "#acc236", "#166a8f", "#00a950", "#58595b",
+                    "#8549ba", "#b24592"
+                ]
+            }]
+        },
+        "options": {
+            "plugins": {
+                "legend": {
+                    "position": "bottom"
+                },
+                "datalabels": {
+                    "formatter": """function(value, context) {
+                        const data = context.chart.data.datasets[0].data;
+                        const sum = data.reduce((a, b) => a + b, 0);
+                        const percentage = (value / sum * 100).toFixed(1);
+                        return percentage + '%';
+                    }""",
+                    "color": "white",
+                    "font": {
+                        "weight": "bold",
+                        "size": 14
+                    }
+                }
+            }
+        },
+        "plugins": ["https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels"]
+    }
+
+    encoded = requests.utils.quote(json.dumps(chart))
+    return f"https://quickchart.io/chart?c={encoded}"
+
 
 # ✅ Run instance check immediately
 check_existing_instance()
@@ -353,10 +539,21 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     symbol = context.args[0].upper()
-    price = get_cached_price(symbol)  # Use cache-enabled function
+    price = get_cached_price(symbol)
 
     if price is not None:
         await update.message.reply_text(f"💰 *{symbol} Price:* ${price:.2f}", parse_mode="Markdown")
+
+        # Generate and send chart
+        url = f"https://min-api.cryptocompare.com/data/v2/histohour?fsym={symbol}&tsym=USD&limit=24"
+        headers = {"authorization": f"Apikey {CRYPTOCOMPARE_API_KEY}"}
+        try:
+            response = requests.get(url, headers=headers)
+            closes = [item["close"] for item in response.json()["Data"]["Data"]]
+            chart_url = generate_price_chart(symbol, closes)
+            await update.message.reply_photo(photo=chart_url, caption=f"{symbol} – 24h Price Trend")
+        except Exception as e:
+            print(f"Chart generation failed: {e}")
     else:
         await update.message.reply_text("⚠️ Couldn't fetch the price. Please try again later.")
 
@@ -823,21 +1020,30 @@ async def trend(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.message.reply_text(f"📊 *RSI for {symbol}*: `{rsi:.2f}`", parse_mode="Markdown")
 
+        # Fetch full list of RSI values
+        prices = get_candles(symbol, 30)
+        rsi_list = calculate_rsi_series(prices)
+        if rsi_list:
+            chart_url = generate_rsi_chart(symbol, rsi_list)
+            await update.message.reply_photo(chart_url, caption=f"{symbol} RSI (14)")
+
     elif indicator == "macd":
         macd, signal, hist = get_macd(symbol)
         if macd is None:
             await update.message.reply_text("⚠️ Could not fetch MACD.")
             return
 
-        direction = "✅ Bullish crossover" if hist > 0 else "🔻 Bearish crossover"
         await update.message.reply_text(
-            f"📉 *MACD for {symbol}*:\n"
-            f"MACD: `{macd:.4f}`\n"
-            f"Signal: `{signal:.4f}`\n"
-            f"Histogram: `{hist:.4f}`\n"
-            f"{direction}",
+            f"📉 *MACD for {symbol}*:\nMACD: `{macd:.4f}`\nSignal: `{signal:.4f}`\nHistogram: `{hist:.4f}`",
             parse_mode="Markdown"
         )
+
+        prices = get_candles(symbol, 50)
+        macd_list, signal_list, hist_list = compute_macd_series(prices)
+        if macd_list:
+            chart_url = generate_macd_chart(symbol, macd_list, signal_list, hist_list)
+            await update.message.reply_photo(chart_url, caption=f"{symbol} MACD")
+
 
     elif indicator == "ema":
         if len(context.args) < 3:
@@ -849,16 +1055,21 @@ async def trend(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Invalid EMA period.")
             return
 
-        prices = get_candles(symbol, period + 5)
-        ema = calculate_ema(prices, period)
+        closes = get_candles(symbol, period + 10)
+        ema = calculate_ema(closes, period)
+
         if ema is None:
             await update.message.reply_text("⚠️ Could not compute EMA.")
             return
 
+        ema_values = [None] * (period - 1)
+        for i in range(period - 1, len(closes)):
+            ema_values.append(calculate_ema(closes[:i+1], period))
+
         await update.message.reply_text(f"📈 *{period}-EMA for {symbol}* is: `${ema:.2f}`", parse_mode="Markdown")
 
-    else:
-        await update.message.reply_text("❌ Invalid indicator. Use rsi, macd, or ema.")
+        chart_url = generate_ema_chart(symbol, closes, ema_values, period)
+        await update.message.reply_photo(chart_url, caption=f"{symbol} – Price vs {period}-EMA")
 
 async def get_cached_rsi(symbol, indicator_cache):
     if "rsi" not in indicator_cache[symbol]:
@@ -1656,6 +1867,9 @@ async def portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_value = 0
     breakdown = "📊 *Your Portfolio:*\n\n"
 
+    symbol_labels = []
+    value_data = []
+
     for symbol, quantity in assets:
         symbol = symbol.upper()
         price = get_crypto_price(symbol)
@@ -1670,9 +1884,16 @@ async def portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_value += value
         breakdown += f"{symbol}: {quantity} × ${price:.4f} = ${value:,.2f}\n"
 
+        # Collect for pie chart
+        symbol_labels.append(symbol)
+        value_data.append(round(value, 2))
 
     breakdown += f"\n💼 *Total Value:* ${total_value:,.2f}"
     await update.message.reply_text(breakdown, parse_mode="Markdown")
+
+    if symbol_labels and value_data:
+        chart_url = generate_portfolio_pie_chart(symbol_labels, value_data)
+        await update.message.reply_photo(chart_url, caption="📊 Portfolio Distribution")
 
 async def portfoliolimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id

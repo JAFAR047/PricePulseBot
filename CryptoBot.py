@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram import Bot
@@ -16,7 +16,8 @@ import aiohttp
 from telegram.ext import ConversationHandler, MessageHandler, filters
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 import nest_asyncio
-
+from telegram.ext import ApplicationBuilder
+from telegram.ext import JobQueue
 nest_asyncio.apply()
 
 EDIT_SELECT, EDIT_UPDATE = range(2)
@@ -264,9 +265,53 @@ api_usage_stats = {
 
 bot_start_time = datetime.utcnow()
 
+def load_coingecko_ids(file_path="coingecko_ids.json", limit=100):
+    import requests
+    import json
+
+    # Try loading from file
+    try:
+        with open(file_path, "r") as f:
+            mapping = json.load(f)
+            print("✅ Loaded CoinGecko IDs from file.")
+            return mapping
+    except Exception:
+        print("⚠️ Could not load local CoinGecko ID file. Fetching from API...")
+
+    # Fetch from API
+    url = f"https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        "vs_currency": "usd",
+        "order": "market_cap_desc",
+        "per_page": limit,
+        "page": 1,
+        "sparkline": False
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        mapping = {
+            coin["symbol"].upper(): coin["id"]
+            for coin in data
+        }
+
+        # Save to file for next time
+        with open(file_path, "w") as f:
+            json.dump(mapping, f, indent=4)
+
+        print("✅ Fetched and saved CoinGecko IDs.")
+        return mapping
+    except Exception as e:
+        print(f"❌ Failed to fetch CoinGecko IDs: {e}")
+        return {}
+
 
 # ✅ Load environment variables
 load_dotenv()
+COINGECKO_IDS = load_coingecko_ids()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("❌ TELEGRAM_BOT_TOKEN is missing! Check your .env file.")
@@ -386,6 +431,21 @@ CREATE TABLE IF NOT EXISTS trade_signals (
 )
 ''')
 
+    cursor.execute('''
+CREATE TABLE IF NOT EXISTS watchlist (
+    user_id INTEGER,
+    symbol TEXT,
+    PRIMARY KEY (user_id, symbol)
+)
+''')
+
+    cursor.execute("PRAGMA table_info(watchlist)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "base_price" not in columns:
+        cursor.execute("ALTER TABLE watchlist ADD COLUMN base_price REAL")
+    if "threshold_percent" not in columns:
+        cursor.execute("ALTER TABLE watchlist ADD COLUMN threshold_percent REAL")
+        
     conn.commit()
     conn.close()
 
@@ -446,6 +506,19 @@ def migrate_add_pro_column():
 
 migrate_add_pro_column()
 
+def migrate_add_autodelete_column():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN autodelete INTEGER DEFAULT NULL")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    conn.close()
+
+migrate_add_autodelete_column()
+
+
 # ✅ Fetch Prices
 
 def get_crypto_price(symbol="BTC"):
@@ -472,64 +545,45 @@ def get_crypto_price(symbol="BTC"):
 # ✅ Telegram Bot Handlers
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if args:
-        command = args[0]
-        fake_update = update  # reuse the same update
-        fake_context = context
-
-        if command == "set":
-            return await set(fake_update, fake_context)
-        elif command == "help":
-            return await help_command(fake_update, fake_context)
-        elif command == "alerts":
-            return await alerts(fake_update, fake_context)
-        elif command == "clear":
-            return await clear_alerts_prompt(fake_update, fake_context)
-        elif command == "best":
-            return await best(fake_update, fake_context)
-        elif command == "worst":
-            return await worst(fake_update, fake_context)
-        elif command == "news":
-            return await news(fake_update, fake_context)
-        elif command == "trend":
-            return await trend(fake_update, fake_context)
-        elif command == "price":
-            return await price(fake_update, fake_context)
-        elif command == "upgrade":
-            return await upgrade(fake_update, fake_context)
-        elif command == "edit":
-            return await edit_alert_start(fake_update, fake_context)
-
-    args = context.args
     user_id = update.effective_user.id
+    args = context.args
 
+    # 1. Ensure user exists in DB
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+    if cursor.fetchone() is None:
+        cursor.execute("INSERT INTO users (user_id, plan, alerts_used, last_reset) VALUES (?, 'free', 0, ?)",
+                       (user_id, datetime.now().strftime("%Y-%m-%d")))
+        conn.commit()
+
+    # 2. Handle deep-link routing
     if args:
-        source = args[0]
-        # Log referral source
-        referral_stats[source] += 1  # replace with DB increment if needed
+        command = args[0].lower()
+        if command in {"set", "help", "alerts", "clear", "best", "worst", "news", "trend", "price", "upgrade", "edit"}:
+            fake_context = context
+            fake_update = update
+            return await globals()[command](fake_update, fake_context)
 
-        # Optionally, log to database
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
+        # 3. Handle referral source
+        source = command
+        cursor.execute('''CREATE TABLE IF NOT EXISTS referrals (
+            source TEXT PRIMARY KEY,
+            clicks INTEGER DEFAULT 0
+        )''')
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS referrals (
-                source TEXT PRIMARY KEY,
-                clicks INTEGER DEFAULT 0
-            )
-        ''')
-        cursor.execute('''
-            INSERT INTO referrals (source, clicks) 
+            INSERT INTO referrals (source, clicks)
             VALUES (?, 1)
             ON CONFLICT(source) DO UPDATE SET clicks = clicks + 1
         ''', (source,))
         conn.commit()
-        conn.close()
 
+    conn.close()
 
-    # Default welcome message if no args
+    # 4. Default welcome message
     await update.message.reply_text(
-        "👋 Welcome to PricePulseBot!\nUse /menu to get started."
+        "👋 Welcome to *PricePulseBot*!\nUse /menu to get started.",
+        parse_mode="Markdown"
     )
 
 
@@ -559,7 +613,7 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_price_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    
+   
     if len(context.args) < 3:
         await update.message.reply_text("❌ Usage: /set BTCUSDT > 70000 [repeat]")
         return
@@ -616,7 +670,7 @@ async def set_price_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         conn.close()
         return
-    
+   
          # ✅ Limit free users to 1 persistent alert
     repeat_flag = 1 if len(context.args) > 3 and context.args[3].lower() == "repeat" else 0
 
@@ -639,7 +693,7 @@ async def set_price_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (user_id, symbol, condition, target_price, repeat_flag)
     )
 
-   
+  
     # Increment alert usage if user is on the free plan
     if plan == 'free':
         cursor.execute(
@@ -1116,11 +1170,11 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
             continue
         if (cond == ">" and price > target) or (cond == "<" and price < target):
             try:
-                await context.bot.send_message(
+                await send_auto_delete(context, context.bot.send_message(
                     chat_id=user_id,
                     text=f"🔔 *Price Alert: {symbol}*\nCurrent price: ${price:.2f} {cond} {target}",
                     parse_mode="Markdown"
-                )
+                ))
             except Exception as e:
                 print(f"Price alert error: {e}")
             if not repeat:
@@ -1136,11 +1190,11 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
         change = abs((price - base_price) / base_price * 100)
         if change >= threshold_percent:
             try:
-                await context.bot.send_message(
+                await send_auto_delete(context, context.bot.send_message(
                     chat_id=user_id,
                     text=f"📉 *% Alert for {symbol}*\nChange: {change:.2f}% from ${base_price:.2f}\nNow: ${price:.2f}",
                     parse_mode="Markdown"
-                )
+                ))
             except Exception as e:
                 print(f"Percent alert error: {e}")
             if not repeat:
@@ -1155,11 +1209,11 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
             continue
         if price <= stop_price or price >= take_price:
             try:
-                await context.bot.send_message(
+                await send_auto_delete(context, context.bot.send_message(
                     chat_id=user_id,
                     text=f"🛑 *Risk Alert for {symbol}*\nPrice hit ${price:.2f}.\nSL: {stop_price}, TP: {take_price}",
                     parse_mode="Markdown"
-                )
+                ))
             except Exception as e:
                 print(f"Risk alert error: {e}")
             if not repeat:
@@ -1200,7 +1254,7 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
 
         if price_match and rsi_match:
             try:
-                await context.bot.send_message(
+                await send_auto_delete(context, context.bot.send_message(
                     chat_id=user_id,
                     text=(
                         f"🧠 *Custom Alert for {symbol}*\n"
@@ -1208,7 +1262,7 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
                         f"Indicator: `{r_cond}` ✅"
                     ),
                     parse_mode="Markdown"
-                )
+                ))
             except Exception as e:
                 print(f"Custom alert error: {e}")
             if not repeat:
@@ -1217,7 +1271,7 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
 
         # --- PORTFOLIO VALUE ALERTS ---
     cursor.execute("""
-    SELECT p.user_id, p.symbol, p.quantity, l.loss_limit, l.profit_target 
+    SELECT p.user_id, p.symbol, p.quantity, l.loss_limit, l.profit_target
     FROM portfolio p
     LEFT JOIN portfolio_limits l ON p.user_id = l.user_id
 """)
@@ -1251,7 +1305,7 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
 
         if loss_limit and total_value <= loss_limit:
             try:
-                await context.bot.send_message(
+                await send_auto_delete(context, context.bot.send_message(
                     chat_id=user_id,
                     text=(
                         f"⚠️ *Portfolio Loss Alert*\n"
@@ -1259,7 +1313,7 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
                         f"Loss limit was: ${loss_limit:,.2f}"
                     ),
                     parse_mode="Markdown"
-                )
+                ))
             except Exception as e:
                 print(f"Portfolio loss alert error: {e}")
 
@@ -1268,7 +1322,7 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
 
         elif profit_target and total_value >= profit_target:
             try:
-                await context.bot.send_message(
+                await send_auto_delete(context, context.bot.send_message(
                     chat_id=user_id,
                     text=(
                         f"🎯 *Portfolio Target Reached*\n"
@@ -1276,11 +1330,34 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
                         f"Target goal was: ${profit_target:,.2f}"
                     ),
                     parse_mode="Markdown"
-                )
+                ))
             except Exception as e:
                 print(f"Portfolio profit alert error: {e}")
 
             cursor.execute("UPDATE portfolio_limits SET profit_target = NULL WHERE user_id = ?", (user_id,))
+            conn.commit()
+            # --- WATCHLIST THRESHOLD ALERTS ---
+    cursor.execute("SELECT user_id, symbol, base_price, threshold_percent FROM watchlist WHERE threshold_percent > 0")
+    for user_id, symbol, base_price, threshold in cursor.fetchall():
+        price = symbol_prices.get(symbol)
+        if price is None:
+            continue
+
+        change = abs((price - base_price) / base_price * 100)
+        if change >= threshold:
+            try:
+                await send_auto_delete(context, context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"📡 *Watchlist Alert for {symbol}*\n"
+                         f"Price moved ±{threshold:.1f}% from ${base_price:.2f}.\n"
+                         f"Current: ${price:.2f} ({change:.2f}% change)",
+                    parse_mode="Markdown"
+                ))
+            except Exception as e:
+                print(f"Watchlist alert error: {e}")
+
+            # Optional: reset the base price to current, so alerts trigger again after another threshold move
+            cursor.execute("UPDATE watchlist SET base_price = ? WHERE user_id = ? AND symbol = ?", (price, user_id, symbol))
             conn.commit()
     conn.close()
 
@@ -1483,7 +1560,7 @@ async def worst(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     url = "https://min-api.cryptocompare.com/data/top/mktcapfull?limit=50&tsym=USDT"
-    
+   
     api_key = os.getenv("CRYPTOCOMPARE_API_KEY")
     headers = {"Authorization": api_key}
 
@@ -1562,6 +1639,144 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data is valid:
         count_api_call()
         return price
+
+async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # Check Pro access
+    cursor.execute("SELECT plan FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    plan = row[0] if row else "free"
+    if plan != "pro":
+        await update.message.reply_text(
+            "🔒 The /watch feature is for *Pro users only*.\nUse /upgrade to unlock it.",
+            parse_mode="Markdown"
+        )
+        conn.close()
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Usage:\n/watch add BTCUSDT\n/watch remove BTCUSDT\n/watch list\n/watch clear")
+        conn.close()
+        return
+
+    action = context.args[0].lower()
+
+    if action == "add" and len(context.args) >= 2:
+        symbol = context.args[1].upper()
+
+        try:
+            # Get base price
+            price = get_crypto_price(symbol)
+            if price is None:
+                await update.message.reply_text("❌ Could not fetch the current price.")
+                conn.close()
+                return
+
+            # Get threshold (optional)
+            threshold = 0  # default: no alerts
+            if len(context.args) == 3:
+                try:
+                    threshold = float(context.args[2])
+                    if threshold <= 0:
+                        raise ValueError
+                except:
+                    await update.message.reply_text("❌ Invalid threshold. Use a positive number like 5.")
+                    conn.close()
+                    return
+
+            try:
+                cursor.execute(
+                    "INSERT INTO watchlist (user_id, symbol, base_price, threshold_percent) VALUES (?, ?, ?, ?)",
+                    (user_id, symbol, price, threshold)
+                )
+                conn.commit()
+                await update.message.reply_text(f"✅ {symbol} added with {threshold}% threshold (Current: ${price:.2f})")
+            except sqlite3.IntegrityError:
+                await update.message.reply_text("⚠️ That symbol is already in your watchlist.")
+        except Exception as e:
+            await update.message.reply_text("❌ An error occurred while processing your request.")
+            print(f"[ERROR] {e}")
+            conn.close()
+            return
+        
+        
+    elif action == "list":
+        cursor.execute("SELECT symbol FROM watchlist WHERE user_id = ?", (user_id,))
+        symbols = [row[0] for row in cursor.fetchall()]
+
+        if not symbols:
+            await update.message.reply_text("📭 Your watchlist is empty.")
+            conn.close()
+            return
+
+        message = "📋 *Your Watchlist Overview:*\n\n"
+        for symbol in symbols:
+            price = get_crypto_price(symbol)
+            trend = get_crypto_trend(symbol, "24H")
+
+            if price is None or trend is None:
+                continue
+
+            emoji = "📈" if trend > 0 else "📉"
+            message += f"{emoji} *{symbol}*: ${price:.2f} ({trend:+.2f}%)\n"
+
+        await update.message.reply_text(message, parse_mode="Markdown")
+        conn.close()
+
+    elif action == "clear":
+        cursor.execute("DELETE FROM watchlist WHERE user_id = ?", (user_id,))
+        conn.commit()
+        await update.message.reply_text("🧹 Your watchlist has been cleared.")
+
+    else:
+        await update.message.reply_text("❌ Invalid command. Use:\n/watch add/remove/list/clear")
+
+    conn.close()
+
+
+async def send_daily_watchlist_summary(context: ContextTypes.DEFAULT_TYPE):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # Get all Pro users with watchlist entries
+    cursor.execute("""
+        SELECT DISTINCT w.user_id 
+        FROM watchlist w
+        JOIN users u ON w.user_id = u.user_id
+        WHERE u.plan = 'pro'
+    """)
+    pro_users = [row[0] for row in cursor.fetchall()]
+
+    for user_id in pro_users:
+        cursor.execute("SELECT symbol FROM watchlist WHERE user_id = ?", (user_id,))
+        symbols = [row[0] for row in cursor.fetchall()]
+
+        if not symbols:
+            continue
+
+        message = f"📊 *Daily Watchlist Summary*\n\n"
+        for symbol in symbols:
+            price = get_crypto_price(symbol)
+            trend = get_crypto_trend(symbol, "24H")  # uses existing function
+            if price is None or trend is None:
+                continue
+            emoji = "📈" if trend > 0 else "📉"
+            message += f"{emoji} *{symbol}*: ${price:.2f} ({trend:+.2f}%)\n"
+
+        try:
+            await send_auto_delete(context, context.bot.send_message(
+                chat_id=user_id,
+                text=message,
+                parse_mode="Markdown"
+            ))
+        except Exception as e:
+            print(f"❌ Error sending watchlist summary to {user_id}: {e}")
+
+    conn.close()
+
 
 async def percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -2171,7 +2386,7 @@ async def handle_signal_action(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
         try:
-            await context.bot.send_message(chat_id=SIGNAL_CHANNEL_ID, text=message, parse_mode="Markdown")
+            await send_auto_delete(context, context.bot.send_message(chat_id=SIGNAL_CHANNEL_ID, text=message, parse_mode="Markdown"))
         except Exception as e:
             print(f"Broadcast error: {e}")
 
@@ -2225,6 +2440,289 @@ async def myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=keyboard)
 
+async def autodelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # Check plan
+    cursor.execute("SELECT plan FROM users WHERE user_id = ?", (user_id,))
+    plan_row = cursor.fetchone()
+
+    if not plan_row or plan_row[0] != "pro":
+        await update.message.reply_text(
+            "🔒 Auto-delete is a *Pro feature*.\nUse /upgrade to unlock this functionality.",
+            parse_mode="Markdown"
+        )
+        conn.close()
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Usage: /autodelete [minutes|off]\nExample: /autodelete 3")
+        conn.close()
+        return
+
+    arg = context.args[0].lower()
+    if arg == "off":
+        cursor.execute("UPDATE users SET autodelete = NULL WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text("🛑 Auto-delete has been disabled.")
+        return
+
+    try:
+        minutes = int(arg)
+        if minutes <= 0 or minutes > 60:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Enter a valid number of minutes (1 to 60).")
+        conn.close()
+        return
+
+    cursor.execute("UPDATE users SET autodelete = ? WHERE user_id = ?", (minutes, user_id))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(f"⏳ Bot messages will auto-delete after {minutes} minute(s).")
+
+async def send_auto_delete(context, message_func, *args, **kwargs):
+    """Wraps any send_message, send_photo, etc., and schedules deletion based on user settings."""
+    user_id = kwargs.get("chat_id")
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT autodelete FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+
+    msg = await message_func(*args, **kwargs)
+
+    if result and result[0]:
+        delay = result[0] * 60
+        context.job_queue.run_once(
+            lambda c: asyncio.create_task(delete_message_safe(c, chat_id=user_id, message_id=msg.message_id)),
+            when=delay
+        )
+    return msg
+
+async def delete_message_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except:
+        pass  # message might already be deleted or inaccessible
+
+
+import urllib.parse
+
+async def chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) == 0:
+        await update.message.reply_text("❌ Usage: /chart BTCUSDT [1H|4H|rsi|macd|ema20]")
+        return
+
+    symbol = context.args[0].upper()
+    arg2 = context.args[1].lower() if len(context.args) > 1 else "1h"
+
+    # --- CASE 1: Standard TradingView Timeframes ---
+    timeframes = {"1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"}
+    if arg2 in timeframes:
+        interval = arg2.upper()
+        await update.message.reply_text("⏳ Generating chart... please wait.")
+        try:
+            image_url = await get_chart_screenshot(symbol, interval)
+            if image_url:
+                await update.message.reply_photo(
+                    photo=image_url,
+                    caption=f"📈 *{symbol}* Chart ({interval}) via TradingView",
+                    parse_mode="Markdown"
+                )
+                count_api_call()
+            else:
+                await update.message.reply_text("❌ Screenshot API failed to return a valid image.")
+        except Exception as e:
+            print(f"/chart error: {e}")
+            await update.message.reply_text("❌ Internal error while generating chart.")
+        return
+
+    # --- CASE 2: Indicator Charts via QuickChart ---
+    try:
+        headers = {"authorization": f"Apikey {CRYPTOCOMPARE_API_KEY}"}
+
+        if arg2 == "rsi":
+            url = f"https://min-api.cryptocompare.com/data/histohour?fsym={symbol}&tsym=USD&limit=30"
+            response = requests.get(url, headers=headers)
+            closes = [d["close"] for d in response.json()["Data"]]
+            rsi_values = calculate_rsi_series(closes)
+            if not rsi_values:
+                await update.message.reply_text("⚠️ Not enough data for RSI.")
+                return
+            chart_url = generate_rsi_chart(symbol, rsi_values)
+            caption = f"{symbol} – RSI(14)"
+
+        elif arg2 == "macd":
+            url = f"https://min-api.cryptocompare.com/data/histohour?fsym={symbol}&tsym=USD&limit=50"
+            response = requests.get(url, headers=headers)
+            closes = [d["close"] for d in response.json()["Data"]]
+            macd, signal, hist = compute_macd_series(closes)
+            if not macd:
+                await update.message.reply_text("⚠️ Not enough data for MACD.")
+                return
+            chart_url = generate_macd_chart(symbol, macd, signal, hist)
+            caption = f"{symbol} – MACD"
+
+        elif arg2.startswith("ema"):
+            try:
+                period = int(arg2[3:])
+            except:
+                await update.message.reply_text("❌ Invalid EMA format. Example: ema20")
+                return
+            url = f"https://min-api.cryptocompare.com/data/histohour?fsym={symbol}&tsym=USD&limit={period+10}"
+            response = requests.get(url, headers=headers)
+            closes = [d["close"] for d in response.json()["Data"]]
+            ema = calculate_ema(closes, period)
+            chart_url = generate_ema_chart(symbol, closes, ema, period)
+            caption = f"{symbol} – EMA({period})"
+
+        else:
+            await update.message.reply_text("❌ Invalid chart type.\nUse: 1H, 4H, rsi, macd, ema20")
+            return
+
+        await update.message.reply_photo(photo=chart_url, caption=caption)
+        count_api_call()
+
+    except Exception as e:
+        print(f"QuickChart error for {symbol}: {e}")
+        await update.message.reply_text("❌ Chart generation failed. Try again later.")
+        
+
+def get_tradingview_url(symbol: str, interval: str = "1H") -> str:
+    symbol = symbol.upper()
+
+    # Ensure quote asset is present, default to USDT if missing
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+
+    return f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}&interval={interval.upper()}"
+
+
+async def get_chart_screenshot(symbol: str, interval: str = "1H") -> str:
+    api_key = os.getenv("SCREENSHOT_API_KEY")
+    if not api_key:
+        raise ValueError("❌ SCREENSHOT_API_KEY is missing in .env")
+
+    target_url = get_tradingview_url(symbol, interval)
+    screenshot_api_url = (
+        f"https://shot.screenshotapi.net/screenshot"
+        f"?token={api_key}"
+        f"&url={urllib.parse.quote(target_url)}"
+        f"&output=image"
+        f"&file_type=png"
+        f"&wait_for_event=load"
+        f"&viewport=1280x720"
+        f"&full_page=true"
+    )
+
+    # We don't need to parse JSON, just return the actual URL
+    return screenshot_api_url
+
+async def coin_info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    coin = update.message.text[1:].upper()  # e.g., "/btc" → "BTC"
+
+    if coin not in COINGECKO_IDS:
+        await update.message.reply_text("❌ Unknown or unsupported coin.")
+        return
+
+    coingecko_id = COINGECKO_IDS[coin]
+    # Fetch price + market data
+    url = f"https://min-api.cryptocompare.com/data/pricemultifull?fsyms={coin}&tsyms=USD"
+    headers = {"authorization": f"Apikey {CRYPTOCOMPARE_API_KEY}"}
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()["RAW"].get(coin, {}).get("USD", {})
+    except Exception as e:
+        print(f"❌ Coin data fetch failed: {e}")
+        await update.message.reply_text("⚠️ Failed to fetch coin data. Please try again later.")
+        return
+
+    if not data:
+        await update.message.reply_text("⚠️ Invalid symbol or data not found.")
+        return
+        
+
+    # Extract data
+    price = data.get("PRICE", 0)
+    high24 = data.get("HIGH24HOUR", 0)
+    low24 = data.get("LOW24HOUR", 0)
+    change1h = data.get("CHANGEPCTHOUR", 0)
+    change24h = data.get("CHANGEPCT24HOUR", 0)
+    volume24h, ath = await get_volume_and_ath_from_coingecko(coin.lower())
+    market_cap = data.get("MKTCAP", 0)
+
+    # Fetch 7d & 30d historical change if needed (optional)
+    percent7d, percent30d = await get_change_percent(coin)
+
+    # Build message
+    msg = (
+        f"📊 *{coin} Snapshot:*\n\n"
+        f"💰 Price: `${price:,.2f}`\n"
+        f"📈 24h High: `${high24:,.2f}`\n"
+        f"📉 24h Low: `${low24:,.2f}`\n\n"
+        f"📊 Change:\n"
+        f"• 1H: `{change1h:+.2f}%`\n"
+        f"• 24H: `{change24h:+.2f}%`\n"
+        f"• 7D: `{percent7d:+.2f}%`\n"
+        f"• 30D: `{percent30d:+.2f}%`\n\n"
+        f"🚀 All-Time High: `${ath:,.2f}`\n"
+        f"📦 24H Volume: `${volume24h:,.2f}`\n"
+        f"🏦 Market Cap: `${market_cap:,.2f}`"
+    )
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def get_change_percent(symbol: str):
+    headers = {"authorization": f"Apikey {CRYPTOCOMPARE_API_KEY}"}
+    base_url = "https://min-api.cryptocompare.com/data"
+
+    try:
+        # Get daily candles
+        response = requests.get(f"{base_url}/histoday?fsym={symbol}&tsym=USD&limit=30", headers=headers)
+        response.raise_for_status()
+        candles = response.json().get("Data", [])
+        if len(candles) < 30:
+            return 0.0, 0.0
+
+        current = candles[-1]["close"]
+        old_7d = candles[-8]["close"]
+        old_30d = candles[0]["close"]
+
+        change7d = ((current - old_7d) / old_7d) * 100
+        change30d = ((current - old_30d) / old_30d) * 100
+        return change7d, change30d
+    except Exception as e:
+        print(f"7d/30d error: {e}")
+        return 0.0, 0.0
+
+    
+
+async def get_volume_and_ath_from_coingecko(coingecko_id):
+    try:
+        url = f"https://api.coingecko.com/api/v3/coins/{symbol.lower()}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                data = await response.json()
+                market_data = data.get("market_data", {})
+                volume = market_data.get("total_volume", {}).get("usd", 0.0)
+                ath = market_data.get("ath", {}).get("usd", 0.0)
+                return volume, ath
+    except Exception as e:
+        print(f"CoinGecko volume/ATH error: {e}")
+        return 0.0, 0.0
+
+
+
+async def dynamic_coin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await coin_info_handler(update, context)
+
+
+
 async def forward_alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2241,7 +2739,7 @@ async def forward_alert_command(update: Update, context: ContextTypes.DEFAULT_TY
         fake_update = update
         fake_context = context
         await context.bot.delete_message(chat_id=query.message.chat_id, message_id=query.message.message_id)
-        await context.bot.send_message(chat_id=query.message.chat_id, text=command)
+        await send_auto_delete(context, context.bot.send_message(chat_id=query.message.chat_id, text=command))
 
 async def toggle_menu_features(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2302,9 +2800,9 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🧠 Group support (manual commands)\n"
     )
 
-    keyboard = InlineKeyboardMarkup([ 
+    keyboard = InlineKeyboardMarkup([
     [InlineKeyboardButton("🔓 Show Pro Features", callback_data="show_pro_features")],
-    [InlineKeyboardButton("🆘 Help Guide", url="https://t.me/EliteTradeSignalBot?start=help")],   
+    [InlineKeyboardButton("🆘 Help Guide", url="https://t.me/EliteTradeSignalBot?start=help")],  
     [InlineKeyboardButton("🚀 Upgrade to Pro", url="https://t.me/EliteTradeSignalBot?start=upgrade")]
 ])
 
@@ -2370,7 +2868,7 @@ async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     )
 
-    
+   
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2382,63 +2880,63 @@ Welcome to your all-in-one crypto alert assistant. Here’s how to use the bot e
 🟢 *FREE FEATURES*
 ━━━━━━━━━━━━━━━━━━━
 
-🔔 `/set BTCUSDT >70000` — Set a price alert  
-📋 `/alerts` — View your active alerts  
-🗑 `/remove <ID>` — Remove an alert by ID  
-🧹 `/clear` — Clear all your alerts  
-✏️ `/edit` — Edit existing alert  
+🔔 `/set BTCUSDT >70000` — Set a price alert 
+📋 `/alerts` — View your active alerts 
+🗑 `/remove <ID>` — Remove an alert by ID 
+🧹 `/clear` — Clear all your alerts 
+✏️ `/edit` — Edit existing alert 
 
-💰 `/price BTCUSDT` — Get live price  
-📈 `/best` — Top 3 Gainers (24h)  
-📉 `/worst` — Top 3 Losers (24h)  
-📰 `/news` — Crypto news headlines  
-🧠 `/menu` — View feature overview  
+💰 `/price BTCUSDT` — Get live price 
+📈 `/best` — Top 3 Gainers (24h) 
+📉 `/worst` — Top 3 Losers (24h) 
+📰 `/news` — Crypto news headlines 
+🧠 `/menu` — View feature overview 
 
 ━━━━━━━━━━━━━━━━━━━
 💎 *PRO FEATURES* (`₦3,000 or $4.99/month`)
 ━━━━━━━━━━━━━━━━━━━
 
-📉 `/percent BTCUSDT 5 repeat` — % move alerts (±5%)  
-📋 `/percentalerts` — View % alerts  
+📉 `/percent BTCUSDT 5 repeat` — % move alerts (±5%) 
+📋 `/percentalerts` — View % alerts 
 🗑 `/removepercent <ID>`
 
-📊 `/volume BTCUSDT 2 repeat` — Volume spike alerts (e.g. 2× avg)  
-📋 `/volumealerts` — View volume alerts  
+📊 `/volume BTCUSDT 2 repeat` — Volume spike alerts (e.g. 2× avg) 
+📋 `/volumealerts` — View volume alerts 
 🗑 `/removevolume <ID>`
 
-🛑 `/risk BTCUSDT 30000 33000 repeat` — SL/TP risk alerts  
-📋 `/riskalerts` — View risk alerts  
+🛑 `/risk BTCUSDT 30000 33000 repeat` — SL/TP risk alerts 
+📋 `/riskalerts` — View risk alerts 
 🗑 `/removerisk <ID>`
 
-🧠 `/custom BTCUSDT >60000 rsi>70 repeat` — Smart combo alerts  
-📋 `/customalerts` — View custom alerts  
+🧠 `/custom BTCUSDT >60000 rsi>70 repeat` — Smart combo alerts 
+📋 `/customalerts` — View custom alerts 
 🗑 `/removecustom <ID>`
 
-💼 `/addasset BTC 1.2` — Add to portfolio  
-📊 `/portfolio` — Portfolio valuation  
-⚠️ `/portfoliolimit 15000` — Loss alert  
-🎯 `/portfoliotarget 25000` — Profit goal alert  
-🗑 `/removeasset BTC` — Remove from portfolio  
+💼 `/addasset BTC 1.2` — Add to portfolio 
+📊 `/portfolio` — Portfolio valuation 
+⚠️ `/portfoliolimit 15000` — Loss alert 
+🎯 `/portfoliotarget 25000` — Profit goal alert 
+🗑 `/removeasset BTC` — Remove from portfolio 
 🔄 `/resetportfolio` — Clear your portfolio
 
-📢 `/signal BTCUSDT >70000 sl=65000 tp=75000` — Submit signal  
-📈 `/signals` — View approved signals  
+📢 `/signal BTCUSDT >70000 sl=65000 tp=75000` — Submit signal 
+📈 `/signals` — View approved signals 
 
 ━━━━━━━━━━━━━━━━━━━
 🚀 *UPGRADE TO PRO*
 ━━━━━━━━━━━━━━━━━━━
 
-Use `/upgrade` for secure payment options.  
-• 🌍 Global (Crypto): **$4.99/month**  
-• 🇳🇬 Nigeria (Bank): **₦3,000/month**  
+Use `/upgrade` for secure payment options. 
+• 🌍 Global (Crypto): **$4.99/month** 
+• 🇳🇬 Nigeria (Bank): **₦3,000/month** 
 _First month ₦2,000 promo available!_
 
 ━━━━━━━━━━━━━━━━━━━
 🔗 *Quick Access*
 ━━━━━━━━━━━━━━━━━━━
-• `/menu` — Feature overview  
-• `/myalerts` — Alert summary  
-• `/howtoadd` — Add bot to group  
+• `/menu` — Feature overview 
+• `/myalerts` — Alert summary 
+• `/howtoadd` — Add bot to group 
 • `/help` — This guide
 
 ℹ️ For support, contact: [@PricePulseDev](https://t.me/PricePulseDev)
@@ -2553,7 +3051,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💹 *Pro Conversion Rate:* `{conversion_rate:.2f}%`\n"
     )
 
-    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+    await send_auto_delete(context, context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown"))
 
 
 # ✅ Main Bot Function
@@ -2584,6 +3082,7 @@ async def main():
     app.add_handler(CommandHandler("best", best))
     app.add_handler(CommandHandler("worst", worst))
     app.add_handler(CommandHandler("news", news))
+    app.add_handler(CommandHandler("watch", watch))
     app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("clear", clear_alerts))
     app.add_handler(CommandHandler("clear", clear_alerts_prompt))
@@ -2594,6 +3093,8 @@ async def main():
     app.add_handler(CommandHandler("custom", custom))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("chart", chart))
+    app.add_handler(CommandHandler("autodelete", autodelete))
     app.add_handler(CommandHandler("addasset", addasset))
     app.add_handler(CommandHandler("portfolio", portfolio))
     app.add_handler(CommandHandler("portfoliolimit", portfoliolimit))
@@ -2618,9 +3119,22 @@ async def main():
 )
     app.add_handler(CallbackQueryHandler(show_user_id, pattern="^show_user_id$"))
 
-    app.job_queue.run_repeating(check_alerts, interval=60, first=10)
+    # Handler for dynamic coin commands like /btc, /eth, /sol, etc.
+    async def dynamic_coin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await coin_info_handler(update, context)
 
-    await app.run_polling()
+    # Register coin aliases
+    coin_aliases = ["btc", "eth", "sol", "xrp", "bnb", "ada", "doge", "matic", "ltc", "dot"]
+    for coin in coin_aliases:
+        app.add_handler(CommandHandler(coin, dynamic_coin_command))
+
+    app.job_queue.run_repeating(check_alerts, interval=60, first=10)
+     #Schedule the daily summary at 9:00 AM UTC
+    job_queue = app.job_queue
+    job_queue.run_daily(send_daily_watchlist_summary, time=dt_time(hour=9, minute=0)) 
+
+    
+    app.run_polling()
 
 
 # ✅ Corrected AsyncIO Handling
@@ -2632,5 +3146,3 @@ if __name__ == "__main__":
     finally:
         cleanup_pid()
         print("✅ PID file removed. Shutdown complete.")
-
-
